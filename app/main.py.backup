@@ -1,0 +1,773 @@
+"""
+Trading Bot Demo - Backend with Auto-Trading Strategy System
+"""
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from datetime import datetime
+import asyncio
+import random
+from typing import List
+from pydantic import BaseModel
+
+# Database setup
+DATABASE_URL = "sqlite:///./trading_demo.db"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Database Models
+class Stock(Base):
+    __tablename__ = "stocks"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String, unique=True, index=True)
+    name = Column(String)
+    current_price = Column(Float)
+    previous_close = Column(Float)
+    volume = Column(Integer, default=0)
+    last_updated = Column(DateTime, default=datetime.utcnow)
+
+class User(Base):
+    __tablename__ = "users"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    balance = Column(Float, default=100000.0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Portfolio(Base):
+    __tablename__ = "portfolio"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    stock_id = Column(Integer, ForeignKey("stocks.id"))
+    quantity = Column(Integer)
+    avg_buy_price = Column(Float)
+
+class PriceHistory(Base):
+    __tablename__ = "price_history"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    stock_id = Column(Integer, ForeignKey("stocks.id"))
+    price = Column(Float)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+class Strategy(Base):
+    __tablename__ = "strategies"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    stock_id = Column(Integer, ForeignKey("stocks.id"))
+    strategy_type = Column(String)  # "TAKE_PROFIT", "STOP_LOSS", "BUY_AT_PRICE"
+    target_percent = Column(Float, nullable=True)
+    target_price = Column(Float, nullable=True)
+    quantity = Column(Integer)
+    is_active = Column(Boolean, default=True)
+    entry_price = Column(Float)  # Price when strategy was created
+    created_at = Column(DateTime, default=datetime.utcnow)
+    triggered_at = Column(DateTime, nullable=True)
+
+class Trade(Base):
+    __tablename__ = "trades"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    stock_id = Column(Integer, ForeignKey("stocks.id"))
+    trade_type = Column(String)  # "BUY" or "SELL"
+    quantity = Column(Integer)
+    price = Column(Float)
+    total_amount = Column(Float)
+    is_auto = Column(Boolean, default=False)
+    strategy_id = Column(Integer, ForeignKey("strategies.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# Pydantic Models
+class StockResponse(BaseModel):
+    id: int
+    symbol: str
+    name: str
+    current_price: float
+    previous_close: float
+    change_percent: float
+    volume: int
+    
+    class Config:
+        from_attributes = True
+
+class PortfolioResponse(BaseModel):
+    id: int
+    stock_symbol: str
+    stock_name: str
+    quantity: int
+    avg_buy_price: float
+    current_price: float
+    total_value: float
+    profit_loss: float
+    profit_loss_percent: float
+
+class StrategyCreate(BaseModel):
+    stock_symbol: str
+    strategy_type: str
+    target_percent: float = None
+    target_price: float = None
+    quantity: int
+
+class StrategyResponse(BaseModel):
+    id: int
+    stock_symbol: str
+    stock_name: str
+    strategy_type: str
+    target_percent: float = None
+    target_price: float = None
+    quantity: int
+    is_active: bool
+    entry_price: float
+    current_price: float
+    created_at: str
+
+class TradeResponse(BaseModel):
+    id: int
+    stock_symbol: str
+    trade_type: str
+    quantity: int
+    price: float
+    total_amount: float
+    is_auto: bool
+    created_at: str
+
+# Create tables
+Base.metadata.create_all(bind=engine)
+
+# FastAPI app
+app = FastAPI(title="Trading Bot Demo API", version="2.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Turkish stock data
+TURKISH_STOCKS = [
+    {"symbol": "GARAN", "name": "Garanti Bankası", "price": 89.50},
+    {"symbol": "ISCTR", "name": "Türkiye İş Bankası", "price": 12.34},
+    {"symbol": "THYAO", "name": "Türk Hava Yolları", "price": 234.50},
+    {"symbol": "AKBNK", "name": "Akbank", "price": 45.67},
+    {"symbol": "YKBNK", "name": "Yapı Kredi Bankası", "price": 23.45},
+    {"symbol": "BIMAS", "name": "BIM Mağazalar", "price": 456.78},
+    {"symbol": "ASELS", "name": "Aselsan", "price": 345.67},
+    {"symbol": "TUPRS", "name": "Tüpraş", "price": 123.45},
+    {"symbol": "PETKM", "name": "Petkim", "price": 34.56},
+    {"symbol": "EREGL", "name": "Ereğli Demir Çelik", "price": 67.89},
+    {"symbol": "SAHOL", "name": "Sabancı Holding", "price": 78.90},
+    {"symbol": "KCHOL", "name": "Koç Holding", "price": 156.78},
+    {"symbol": "TTKOM", "name": "Türk Telekom", "price": 45.67},
+    {"symbol": "PGSUS", "name": "Pegasus", "price": 234.56},
+    {"symbol": "MGROS", "name": "Migros", "price": 345.67},
+    {"symbol": "SOKM", "name": "Şok Marketler", "price": 234.56},
+    {"symbol": "HALKB", "name": "Halkbank", "price": 23.45},
+    {"symbol": "VAKBN", "name": "Vakıfbank", "price": 34.56},
+    {"symbol": "DOHOL", "name": "Doğan Holding", "price": 12.34},
+    {"symbol": "TOASO", "name": "Tofaş", "price": 123.45},
+]
+
+def init_db():
+    db = SessionLocal()
+    existing = db.query(Stock).first()
+    if existing:
+        print("Database already initialized")
+        return
+    
+    print("Initializing database...")
+    for stock_data in TURKISH_STOCKS:
+        stock = Stock(
+            symbol=stock_data["symbol"],
+            name=stock_data["name"],
+            current_price=stock_data["price"],
+            previous_close=stock_data["price"]
+        )
+        db.add(stock)
+    
+    user = User(username="demo_user", balance=100000.0)
+    db.add(user)
+    db.commit()
+    print(f"Added {len(TURKISH_STOCKS)} stocks and demo user")
+    db.close()
+# Auto-Trading Bot - Fully Automated
+bot_enabled = {"value": False}  # Global bot state
+
+async def auto_trading_bot():
+    """Fully automated trading bot - scans all stocks and trades automatically"""
+    while True:
+        if not bot_enabled["value"]:
+            await asyncio.sleep(3)
+            continue
+            
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter(User.username == "demo_user").first()
+            if not user:
+                await asyncio.sleep(3)
+                continue
+            
+            stocks = db.query(Stock).all()
+            
+            for stock in stocks:
+                # Calculate change percentage
+                change_percent = ((stock.current_price - stock.previous_close) / stock.previous_close) * 100
+                
+                # BUY LOGIC: Stock dropped by 1.5% or more
+                if change_percent <= -1.5:
+                    # Use max 10% of balance per trade
+                    max_investment = user.balance * 0.10
+                    quantity = int(max_investment / stock.current_price)
+                    
+                    if quantity > 0 and user.balance >= (stock.current_price * quantity):
+                        cost = stock.current_price * quantity
+                        user.balance -= cost
+                        
+                        # Add to portfolio
+                        portfolio_item = db.query(Portfolio).filter(
+                            Portfolio.user_id == user.id,
+                            Portfolio.stock_id == stock.id
+                        ).first()
+                        
+                        if portfolio_item:
+                            total_cost = (portfolio_item.avg_buy_price * portfolio_item.quantity) + cost
+                            portfolio_item.quantity += quantity
+                            portfolio_item.avg_buy_price = total_cost / portfolio_item.quantity
+                        else:
+                            portfolio_item = Portfolio(
+                                user_id=user.id,
+                                stock_id=stock.id,
+                                quantity=quantity,
+                                avg_buy_price=stock.current_price
+                            )
+                            db.add(portfolio_item)
+                        
+                        # Record trade
+                        trade = Trade(
+                            user_id=user.id,
+                            stock_id=stock.id,
+                            trade_type="BUY",
+                            quantity=quantity,
+                            price=stock.current_price,
+                            total_amount=cost,
+                            is_auto=True
+                        )
+                        db.add(trade)
+                        db.commit()
+                        
+                        print(f"🤖 AUTO-BUY: {quantity} {stock.symbol} @ ₺{stock.current_price:.2f} (Düşüş: {change_percent:.2f}%)")
+                
+                # SELL LOGIC: Stock went up by 2% or more from avg buy price
+                portfolio_item = db.query(Portfolio).filter(
+                    Portfolio.user_id == user.id,
+                    Portfolio.stock_id == stock.id
+                ).first()
+                
+                if portfolio_item:
+                    profit_percent = ((stock.current_price - portfolio_item.avg_buy_price) / portfolio_item.avg_buy_price) * 100
+                    
+                    if profit_percent >= 2.0:
+                        # Sell all of this stock
+                        quantity = portfolio_item.quantity
+                        revenue = stock.current_price * quantity
+                        user.balance += revenue
+                        
+                        # Remove from portfolio
+                        db.delete(portfolio_item)
+                        
+                        # Record trade
+                        trade = Trade(
+                            user_id=user.id,
+                            stock_id=stock.id,
+                            trade_type="SELL",
+                            quantity=quantity,
+                            price=stock.current_price,
+                            total_amount=revenue,
+                            is_auto=True
+                        )
+                        db.add(trade)
+                        db.commit()
+                        
+                        print(f"🤖 AUTO-SELL: {quantity} {stock.symbol} @ ₺{stock.current_price:.2f} (Kar: {profit_percent:.2f}%)")
+            
+            db.commit()
+        except Exception as e:
+            print(f"Auto-trading bot error: {e}")
+            db.rollback()
+        finally:
+            db.close()
+        
+        await asyncio.sleep(3)  # Check every 3 seconds
+
+# Strategy Engine - Checks and executes strategies
+async def strategy_engine():
+    """Checks all active strategies and executes trades when conditions are met"""
+    while True:
+        db = SessionLocal()
+        try:
+            strategies = db.query(Strategy).filter(Strategy.is_active == True).all()
+            
+            for strategy in strategies:
+                stock = db.query(Stock).filter(Stock.id == strategy.stock_id).first()
+                user = db.query(User).filter(User.id == strategy.user_id).first()
+                
+                if not stock or not user:
+                    continue
+                
+                # Calculate change percent from entry price
+                change_percent = ((stock.current_price - strategy.entry_price) / strategy.entry_price) * 100
+                
+                should_execute = False
+                trade_type = None
+                
+                if strategy.strategy_type == "TAKE_PROFIT":
+                    # Sell if price increased by target percent
+                    if change_percent >= strategy.target_percent:
+                        should_execute = True
+                        trade_type = "SELL"
+                        
+                elif strategy.strategy_type == "STOP_LOSS":
+                    # Sell if price decreased by target percent
+                    if change_percent <= -strategy.target_percent:
+                        should_execute = True
+                        trade_type = "SELL"
+                        
+                elif strategy.strategy_type == "BUY_AT_PRICE":
+                    # Buy if price reached target
+                    if stock.current_price <= strategy.target_price:
+                        should_execute = True
+                        trade_type = "BUY"
+                
+                if should_execute:
+                    # Execute the trade
+                    if trade_type == "SELL":
+                        # Check if user has the stock
+                        portfolio_item = db.query(Portfolio).filter(
+                            Portfolio.user_id == user.id,
+                            Portfolio.stock_id == stock.id
+                        ).first()
+                        
+                        if portfolio_item and portfolio_item.quantity >= strategy.quantity:
+                            # Execute sell
+                            revenue = stock.current_price * strategy.quantity
+                            user.balance += revenue
+                            portfolio_item.quantity -= strategy.quantity
+                            
+                            if portfolio_item.quantity == 0:
+                                db.delete(portfolio_item)
+                            
+                            # Record trade
+                            trade = Trade(
+                                user_id=user.id,
+                                stock_id=stock.id,
+                                trade_type="SELL",
+                                quantity=strategy.quantity,
+                                price=stock.current_price,
+                                total_amount=revenue,
+                                is_auto=True,
+                                strategy_id=strategy.id
+                            )
+                            db.add(trade)
+                            
+                            # Deactivate strategy
+                            strategy.is_active = False
+                            strategy.triggered_at = datetime.utcnow()
+                            
+                            print(f"✅ AUTO-SELL: {strategy.quantity} {stock.symbol} @ ₺{stock.current_price:.2f}")
+                    
+                    elif trade_type == "BUY":
+                        cost = stock.current_price * strategy.quantity
+                        if user.balance >= cost:
+                            # Execute buy
+                            user.balance -= cost
+                            
+                            portfolio_item = db.query(Portfolio).filter(
+                                Portfolio.user_id == user.id,
+                                Portfolio.stock_id == stock.id
+                            ).first()
+                            
+                            if portfolio_item:
+                                total_cost = (portfolio_item.avg_buy_price * portfolio_item.quantity) + cost
+                                portfolio_item.quantity += strategy.quantity
+                                portfolio_item.avg_buy_price = total_cost / portfolio_item.quantity
+                            else:
+                                portfolio_item = Portfolio(
+                                    user_id=user.id,
+                                    stock_id=stock.id,
+                                    quantity=strategy.quantity,
+                                    avg_buy_price=stock.current_price
+                                )
+                                db.add(portfolio_item)
+                            
+                            # Record trade
+                            trade = Trade(
+                                user_id=user.id,
+                                stock_id=stock.id,
+                                trade_type="BUY",
+                                quantity=strategy.quantity,
+                                price=stock.current_price,
+                                total_amount=cost,
+                                is_auto=True,
+                                strategy_id=strategy.id
+                            )
+                            db.add(trade)
+                            
+                            # Deactivate strategy
+                            strategy.is_active = False
+                            strategy.triggered_at = datetime.utcnow()
+                            
+                            print(f"✅ AUTO-BUY: {strategy.quantity} {stock.symbol} @ ₺{stock.current_price:.2f}")
+                    
+                    db.commit()
+        
+        except Exception as e:
+            print(f"Strategy engine error: {e}")
+            db.rollback()
+        finally:
+            db.close()
+        
+        await asyncio.sleep(3)  # Check every 3 seconds
+
+# Price simulator
+async def price_simulator():
+    while True:
+        db = SessionLocal()
+        stocks = db.query(Stock).all()
+        
+        for stock in stocks:
+            change_percent = random.uniform(-0.02, 0.02)
+            new_price = stock.current_price * (1 + change_percent)
+            new_price = round(new_price, 2)
+            
+            stock.current_price = new_price
+            stock.volume += random.randint(100, 10000)
+            stock.last_updated = datetime.utcnow()
+            
+            price_history = PriceHistory(
+                stock_id=stock.id,
+                price=new_price,
+                timestamp=datetime.utcnow()
+            )
+            db.add(price_history)
+        
+        db.commit()
+        db.close()
+        await asyncio.sleep(3)
+
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+    asyncio.create_task(price_simulator())
+    asyncio.create_task(strategy_engine())
+    asyncio.create_task(auto_trading_bot())  # 👈 BU SATIRI EKLE
+    print("✅ Server started - Price simulator, Strategy engine and Auto-trading bot running")
+
+@app.get("/")
+async def root():
+    return {"message": "Trading Bot with Auto-Trading", "version": "2.0.0"}
+
+@app.get("/api/stocks", response_model=List[StockResponse])
+async def get_stocks():
+    db = SessionLocal()
+    stocks = db.query(Stock).all()
+    result = []
+    for stock in stocks:
+        change = ((stock.current_price - stock.previous_close) / stock.previous_close) * 100
+        result.append(StockResponse(
+            id=stock.id,
+            symbol=stock.symbol,
+            name=stock.name,
+            current_price=stock.current_price,
+            previous_close=stock.previous_close,
+            change_percent=round(change, 2),
+            volume=stock.volume
+        ))
+    db.close()
+    return result
+
+@app.get("/api/stocks/{symbol}")
+async def get_stock_detail(symbol: str):
+    db = SessionLocal()
+    stock = db.query(Stock).filter(Stock.symbol == symbol).first()
+    if not stock:
+        raise HTTPException(status_code=404, detail="Stock not found")
+    
+    change = ((stock.current_price - stock.previous_close) / stock.previous_close) * 100
+    result = {
+        "id": stock.id,
+        "symbol": stock.symbol,
+        "name": stock.name,
+        "current_price": stock.current_price,
+        "previous_close": stock.previous_close,
+        "change_percent": round(change, 2),
+        "volume": stock.volume,
+        "last_updated": stock.last_updated.isoformat()
+    }
+    db.close()
+    return result
+
+@app.get("/api/history/{symbol}")
+async def get_price_history(symbol: str, limit: int = 50):
+    db = SessionLocal()
+    stock = db.query(Stock).filter(Stock.symbol == symbol).first()
+    if not stock:
+        raise HTTPException(status_code=404, detail="Stock not found")
+    
+    history = db.query(PriceHistory).filter(
+        PriceHistory.stock_id == stock.id
+    ).order_by(PriceHistory.timestamp.desc()).limit(limit).all()
+    
+    result = [{"price": h.price, "timestamp": h.timestamp.isoformat()} for h in reversed(history)]
+    db.close()
+    return result
+
+@app.get("/api/user")
+async def get_user():
+    db = SessionLocal()
+    user = db.query(User).filter(User.username == "demo_user").first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    result = {
+        "id": user.id,
+        "username": user.username,
+        "balance": user.balance,
+        "created_at": user.created_at.isoformat()
+    }
+    db.close()
+    return result
+
+@app.get("/api/portfolio", response_model=List[PortfolioResponse])
+async def get_portfolio():
+    db = SessionLocal()
+    portfolio_items = db.query(Portfolio).filter(Portfolio.user_id == 1).all()
+    
+    result = []
+    for item in portfolio_items:
+        stock = db.query(Stock).filter(Stock.id == item.stock_id).first()
+        total_value = item.quantity * stock.current_price
+        cost = item.quantity * item.avg_buy_price
+        profit_loss = total_value - cost
+        profit_loss_percent = (profit_loss / cost) * 100 if cost > 0 else 0
+        
+        result.append(PortfolioResponse(
+            id=item.id,
+            stock_symbol=stock.symbol,
+            stock_name=stock.name,
+            quantity=item.quantity,
+            avg_buy_price=item.avg_buy_price,
+            current_price=stock.current_price,
+            total_value=round(total_value, 2),
+            profit_loss=round(profit_loss, 2),
+            profit_loss_percent=round(profit_loss_percent, 2)
+        ))
+    
+    db.close()
+    return result
+
+@app.post("/api/buy")
+async def buy_stock(symbol: str, quantity: int):
+    db = SessionLocal()
+    stock = db.query(Stock).filter(Stock.symbol == symbol).first()
+    if not stock:
+        raise HTTPException(status_code=404, detail="Stock not found")
+    
+    user = db.query(User).filter(User.username == "demo_user").first()
+    cost = stock.current_price * quantity
+    
+    if user.balance < cost:
+        raise HTTPException(status_code=400, detail="Insufficient balance")
+    
+    user.balance -= cost
+    
+    portfolio_item = db.query(Portfolio).filter(
+        Portfolio.user_id == user.id,
+        Portfolio.stock_id == stock.id
+    ).first()
+    
+    if portfolio_item:
+        total_cost = (portfolio_item.avg_buy_price * portfolio_item.quantity) + cost
+        portfolio_item.quantity += quantity
+        portfolio_item.avg_buy_price = total_cost / portfolio_item.quantity
+    else:
+        portfolio_item = Portfolio(
+            user_id=user.id,
+            stock_id=stock.id,
+            quantity=quantity,
+            avg_buy_price=stock.current_price
+        )
+        db.add(portfolio_item)
+    
+    # Record manual trade
+    trade = Trade(
+        user_id=user.id,
+        stock_id=stock.id,
+        trade_type="BUY",
+        quantity=quantity,
+        price=stock.current_price,
+        total_amount=cost,
+        is_auto=False
+    )
+    db.add(trade)
+    
+    db.commit()
+    db.close()
+    return {"message": f"Successfully bought {quantity} shares of {symbol}"}
+
+@app.post("/api/sell")
+async def sell_stock(symbol: str, quantity: int):
+    db = SessionLocal()
+    stock = db.query(Stock).filter(Stock.symbol == symbol).first()
+    if not stock:
+        raise HTTPException(status_code=404, detail="Stock not found")
+    
+    user = db.query(User).filter(User.username == "demo_user").first()
+    portfolio_item = db.query(Portfolio).filter(
+        Portfolio.user_id == user.id,
+        Portfolio.stock_id == stock.id
+    ).first()
+    
+    if not portfolio_item or portfolio_item.quantity < quantity:
+        raise HTTPException(status_code=400, detail="Insufficient shares")
+    
+    revenue = stock.current_price * quantity
+    user.balance += revenue
+    portfolio_item.quantity -= quantity
+    
+    if portfolio_item.quantity == 0:
+        db.delete(portfolio_item)
+    
+    # Record manual trade
+    trade = Trade(
+        user_id=user.id,
+        stock_id=stock.id,
+        trade_type="SELL",
+        quantity=quantity,
+        price=stock.current_price,
+        total_amount=revenue,
+        is_auto=False
+    )
+    db.add(trade)
+    
+    db.commit()
+    db.close()
+    return {"message": f"Successfully sold {quantity} shares of {symbol}"}
+
+# STRATEGY ENDPOINTS
+@app.post("/api/strategies")
+async def create_strategy(strategy: StrategyCreate):
+    db = SessionLocal()
+    
+    stock = db.query(Stock).filter(Stock.symbol == strategy.stock_symbol).first()
+    if not stock:
+        raise HTTPException(status_code=404, detail="Stock not found")
+    
+    user = db.query(User).filter(User.username == "demo_user").first()
+    
+    new_strategy = Strategy(
+        user_id=user.id,
+        stock_id=stock.id,
+        strategy_type=strategy.strategy_type,
+        target_percent=strategy.target_percent,
+        target_price=strategy.target_price,
+        quantity=strategy.quantity,
+        entry_price=stock.current_price,
+        is_active=True
+    )
+    
+    db.add(new_strategy)
+    db.commit()
+    db.close()
+    
+    return {"message": "Strategy created successfully"}
+
+@app.get("/api/strategies", response_model=List[StrategyResponse])
+async def get_strategies():
+    db = SessionLocal()
+    strategies = db.query(Strategy).filter(Strategy.user_id == 1).all()
+    
+    result = []
+    for s in strategies:
+        stock = db.query(Stock).filter(Stock.id == s.stock_id).first()
+        result.append(StrategyResponse(
+            id=s.id,
+            stock_symbol=stock.symbol,
+            stock_name=stock.name,
+            strategy_type=s.strategy_type,
+            target_percent=s.target_percent,
+            target_price=s.target_price,
+            quantity=s.quantity,
+            is_active=s.is_active,
+            entry_price=s.entry_price,
+            current_price=stock.current_price,
+            created_at=s.created_at.isoformat()
+        ))
+    
+    db.close()
+    return result
+
+@app.delete("/api/strategies/{strategy_id}")
+async def delete_strategy(strategy_id: int):
+    db = SessionLocal()
+    strategy = db.query(Strategy).filter(Strategy.id == strategy_id).first()
+    
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    
+    db.delete(strategy)
+    db.commit()
+    db.close()
+    
+    return {"message": "Strategy deleted"}
+
+@app.get("/api/trades", response_model=List[TradeResponse])
+async def get_trades():
+    db = SessionLocal()
+    trades = db.query(Trade).filter(Trade.user_id == 1).order_by(Trade.created_at.desc()).limit(50).all()
+    
+    result = []
+    for t in trades:
+        stock = db.query(Stock).filter(Stock.id == t.stock_id).first()
+        result.append(TradeResponse(
+            id=t.id,
+            stock_symbol=stock.symbol,
+            trade_type=t.trade_type,
+            quantity=t.quantity,
+            price=t.price,
+            total_amount=t.total_amount,
+            is_auto=t.is_auto,
+            created_at=t.created_at.isoformat()
+        ))
+    
+    db.close()
+    return result
+# BOT CONTROL ENDPOINTS
+@app.post("/api/bot/start")
+async def start_bot():
+    bot_enabled["value"] = True
+    return {"message": "Bot başlatıldı", "status": "running"}
+
+@app.post("/api/bot/stop")
+async def stop_bot():
+    bot_enabled["value"] = False
+    return {"message": "Bot durduruldu", "status": "stopped"}
+
+@app.get("/api/bot/status")
+async def get_bot_status():
+    return {
+        "enabled": bot_enabled["value"],
+        "status": "running" if bot_enabled["value"] else "stopped"
+    }
+    
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
